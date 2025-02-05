@@ -6,110 +6,174 @@ class PDFToMarkdown {
   constructor(options = {}) {
     this.options = {
       preserveFormatting: true,
-      includeImages: false,
       preserveLinks: true,
+      customPageRender: true,
       ...options
     };
+    this.hyperlinks = new Map();
   }
 
   async convertFile(pdfPath, outputPath = null) {
     try {
       const dataBuffer = fs.readFileSync(pdfPath);
-      const pdfData = await pdf(dataBuffer);
       
-      // Process the raw text content
-      const pages = pdfData.text.split(/\f/); // Split by form feed character
-      let markdown = pages.map(page => this.processPage(page)).join('\n\n');
-      
+      const options = {
+        pagerender: this.renderPage.bind(this),
+        max: 0,
+        firstPage: 1
+      };
+
+      const pdfData = await pdf(dataBuffer, options);
+      const markdown = await this.processContent(pdfData);
+
       if (outputPath) {
-        const sanitizedPath = sanitize(outputPath);
-        fs.writeFileSync(sanitizedPath, markdown);
+        fs.writeFileSync(sanitize(outputPath), markdown);
       }
-      
+
       return markdown;
     } catch (error) {
       throw new Error(`Conversion failed: ${error.message}`);
     }
   }
 
+  async renderPage(pageData) {
+    try {
+      const textContent = await pageData.getTextContent({
+        normalizeWhitespace: true,
+        disableCombineTextItems: false
+      });
+
+      let text = '';
+      let lastY;
+      let links = [];
+
+      for (let item of textContent.items) {
+        if (lastY !== item.transform[5] && text.length > 0) {
+          text += '\n';
+        }
+
+        text += item.str;
+        lastY = item.transform[5];
+
+        if (item.hasOwnProperty('url')) {
+          links.push({
+            text: item.str,
+            url: item.url,
+            x: item.transform[4],
+            y: item.transform[5],
+            width: item.width
+          });
+        }
+      }
+
+      // Store links with their position data
+      this.hyperlinks.set(pageData.pageNumber, links);
+
+      return text;
+    } catch (error) {
+      console.error(`Error rendering page: ${error.message}`);
+      return '';
+    }
+  }
+
+  async processContent(pdfData) {
+    const pages = pdfData.text.split(/\f/).filter(page => page.trim());
+    
+    let processedPages = pages.map((page, index) => {
+      let processedText = this.processPage(page);
+      
+      // Insert hyperlinks
+      const pageLinks = this.hyperlinks.get(index + 1) || [];
+      processedText = this.insertHyperlinks(processedText, pageLinks);
+      
+      return processedText;
+    });
+
+    return processedPages.join('\n\n---\n\n');
+  }
+
+  insertHyperlinks(text, links) {
+    if (!links.length) return text;
+
+    let result = text;
+    links.forEach(link => {
+      if (link.text && link.url) {
+        const markdownLink = `[${link.text}](${link.url})`;
+        // Use regex to replace the exact text while preserving case
+        const regex = new RegExp(`(?<!\\[)${this.escapeRegExp(link.text)}(?!\\])`, 'g');
+        result = result.replace(regex, markdownLink);
+      }
+    });
+
+    return result;
+  }
+
+  escapeRegExp(string) {
+    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
   processPage(pageText) {
-    // Remove excessive whitespace while preserving paragraphs
     let text = pageText
       .replace(/\r\n/g, '\n')
-      .replace(/\t/g, '    ')
+      .replace(/([^\n])\n([^\n])/g, '$1 $2')
       .replace(/\n{3,}/g, '\n\n')
-      .split('\n')
-      .map(line => line.trim())
-      .join('\n');
+      .trim();
 
-    // Process different elements
     text = this.detectAndFormatHeaders(text);
     text = this.detectAndFormatLists(text);
-    text = this.formatParagraphs(text);
-
-    return text.trim();
+    
+    return text;
   }
 
   detectAndFormatHeaders(text) {
     const lines = text.split('\n');
-    let formatted = [];
-    let previousLineEmpty = true;
-
-    for (let i = 0; i < lines.length; i++) {
-      let line = lines[i].trim();
-      let nextLine = lines[i + 1]?.trim() || '';
+    const formatted = lines.map((line, index) => {
+      const trimmedLine = line.trim();
       
-      // Header detection rules
-      if (line && previousLineEmpty && 
-          (line.length < 100 && line.toUpperCase() === line || 
-           line.match(/^[A-Z][^.!?]*$/))) {
-        formatted.push(`# ${line}`);
-      } else if (line && nextLine && nextLine.match(/^[=\-]{3,}$/)) {
-        formatted.push(`# ${line}`);
-        i++; // Skip the underlining
-      } else {
-        formatted.push(line);
+      if (!trimmedLine) return '';
+      
+      // Header detection patterns
+      if (
+        (trimmedLine.length < 100 && /^[A-Z][^a-z]{0,3}[A-Z\s\d]{3,}$/.test(trimmedLine)) ||
+        (/^[A-Z][\w\s]{2,50}$/.test(trimmedLine) && trimmedLine.toUpperCase() === trimmedLine)
+      ) {
+        return `# ${trimmedLine}`;
       }
       
-      previousLineEmpty = !line;
-    }
+      return trimmedLine;
+    });
 
     return formatted.join('\n');
   }
 
   detectAndFormatLists(text) {
     const lines = text.split('\n');
-    let formatted = [];
     let inList = false;
-
-    for (let i = 0; i < lines.length; i++) {
-      let line = lines[i].trim();
+    let listIndent = 0;
+    
+    const formatted = lines.map((line, index) => {
+      const trimmedLine = line.trim();
       
       // Detect list items
-      if (line.match(/^[\d]+[\.)]\s+/)) {
+      const bulletMatch = trimmedLine.match(/^[-•*]\s+(.+)/);
+      const numberMatch = trimmedLine.match(/^(\d+[.)])\s+(.+)/);
+      
+      if (bulletMatch) {
         inList = true;
-        formatted.push(line);
-      } else if (line.match(/^[-•*]\s+/)) {
+        return `- ${bulletMatch[1]}`;
+      } else if (numberMatch) {
         inList = true;
-        formatted.push(line.replace(/^[-•*]\s+/, '- '));
-      } else if (inList && line.match(/^\s+/)) {
-        // Continuation of list item
-        formatted.push(line);
+        return `${numberMatch[1]} ${numberMatch[2]}`;
+      } else if (inList && /^\s+/.test(line)) {
+        // Continue list with indentation
+        return line;
       } else {
         inList = false;
-        formatted.push(line);
+        return line;
       }
-    }
+    });
 
     return formatted.join('\n');
-  }
-
-  formatParagraphs(text) {
-    // Add proper spacing between paragraphs
-    return text
-      .replace(/\n{3,}/g, '\n\n')
-      .replace(/([^\n])\n([^\n])/g, '$1 $2')
-      .trim();
   }
 }
 

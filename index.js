@@ -55,6 +55,7 @@ class PDFToMarkdown {
         text += item.str;
         lastY = item.transform[5];
 
+        // Check if the item has a URL and store it
         if (item.hasOwnProperty('url')) {
           links.push({
             text: item.str,
@@ -127,7 +128,7 @@ class PDFToMarkdown {
 
   detectAndFormatHeaders(text) {
     const lines = text.split('\n');
-    const formatted = lines.map((line, index) => {
+    const formatted = lines.map((line) => {
       const trimmedLine = line.trim();
       
       if (!trimmedLine) return '';
@@ -149,9 +150,8 @@ class PDFToMarkdown {
   detectAndFormatLists(text) {
     const lines = text.split('\n');
     let inList = false;
-    let listIndent = 0;
     
-    const formatted = lines.map((line, index) => {
+    const formatted = lines.map((line) => {
       const trimmedLine = line.trim();
       
       // Detect list items

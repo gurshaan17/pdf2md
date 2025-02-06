@@ -38,71 +38,73 @@ class PDFToMarkdown {
 
   async renderPage(pageData) {
     try {
-      // Get text content with all available metadata
+      // Get text content
       const textContent = await pageData.getTextContent({
         normalizeWhitespace: true,
-        disableCombineTextItems: false,
-        includeMarkedContent: true
+        disableCombineTextItems: false
       });
-
-      // Process and store the text content
-      const { text, links } = this.processPageContent(textContent, pageData.pageNumber);
+  
+      // Get annotations (includes links)
+      const annotations = await pageData.getAnnotations();
+  
+      // Process and store the text content and links
+      const { text, links } = this.processPageContent(textContent, annotations, pageData.pageNumber);
       this.pageTexts.set(pageData.pageNumber, text);
       this.hyperlinks.set(pageData.pageNumber, links);
-
+  
       return text;
     } catch (error) {
       console.error(`Error rendering page ${pageData.pageNumber}:`, error);
       return '';
     }
   }
+  
 
-  processPageContent(textContent, pageNumber) {
+  processPageContent(textContent, annotations, pageNumber) {
     let text = '';
     let lastY;
     const links = [];
-    const textItems = [];
-
-    // First pass: collect all text items with their positions
+  
+    // Create a map of annotations by their positions (x, y)
+    const annotationMap = annotations
+      .filter(ann => ann.subtype === 'Link' && ann.url)  // Only keep link annotations
+      .map(ann => ({
+        x: ann.rect[0],  // X-coordinate of the annotation
+        y: ann.rect[1],  // Y-coordinate of the annotation
+        url: ann.url     // URL of the link
+      }));
+  
     for (const item of textContent.items) {
       const [, , , , x, y] = item.transform;
-      
-      // Store text item with position information
-      textItems.push({
-        text: item.str,
-        x: x,
-        y: y,
-        width: item.width,
-        height: item.height || 0,
-        hasLink: item.hasOwnProperty('link') || item.hasOwnProperty('url')
-      });
-
+  
       // Build the page text
       if (lastY !== undefined && Math.abs(lastY - y) > 5) {
         text += '\n';
       }
       text += item.str;
       lastY = y;
-
-      // Check for link properties
-      if (item.link || item.url) {
+  
+      // Check if this text item matches any annotation
+      const matchingAnnotation = annotationMap.find(
+        ann => Math.abs(ann.x - x) < 5 && Math.abs(ann.y - y) < 5
+      );
+  
+      if (matchingAnnotation) {
         links.push({
           text: item.str,
-          url: item.link || item.url,
+          url: matchingAnnotation.url,
           x: x,
           y: y
         });
       }
     }
-
-    // Second pass: combine adjacent text items that might be part of the same link
-    const combinedLinks = this.combineAdjacentLinks(textItems, links);
-
+  
     return {
       text,
-      links: combinedLinks
+      links
     };
   }
+  
 
   combineAdjacentLinks(textItems, rawLinks) {
     const combinedLinks = [];

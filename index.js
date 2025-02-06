@@ -57,53 +57,43 @@ class PDFToMarkdown {
     }
   }
   
-  isWithinAnnotation(x, y, rect) {
-    const [x1, y1, x2, y2] = rect;
-    return x >= x1 && x <= x2 && y >= y1 && y <= y2;
-  }
-  
-  
-
   processPageContent(textContent, annotations) {
     let text = '';
     let lastY;
-    const links = new Set();
-  
-    // Map annotations to their approximate positions
-    const annotationMap = annotations
-      .filter(ann => ann.subtype === 'Link' && ann.url)
-      .map(ann => ({
-        url: ann.url,
-        rect: ann.rect
-      }));
+    const links = [];
+    const seenLinks = new Set();  // Track unique links
   
     for (const item of textContent.items) {
       const [, , , , x, y] = item.transform;
   
       if (lastY !== undefined && Math.abs(lastY - y) > 5) {
-        text += '\n';
+        text += '\n';  // New line when moving to a new row
       }
       text += item.str;
       lastY = y;
   
-      for (const ann of annotationMap) {
-        if (this.isWithinAnnotation(x, y, ann.rect)) {
-          links.add({
-            text: item.str,
-            url: ann.url
-          });
+      annotations.forEach(ann => {
+        if (ann.subtype === 'Link' && ann.url && this.isWithinAnnotation(x, y, ann.rect)) {
+          if (!seenLinks.has(ann.url)) {
+            links.push({ text: item.str, url: ann.url });
+            seenLinks.add(ann.url);
+          }
         }
-      }
+      });
     }
-  
     return {
       text,
-      links: Array.from(links)  // Convert Set back to array
+      links
     };
   }
   
-  
-  
+  isWithinAnnotation(x, y, rect) {
+    // Check if the (x, y) position falls within the annotation rectangle
+    return (
+      x >= rect[0] && x <= rect[2] &&
+      y >= rect[1] && y <= rect[3]
+    );
+  }
 
   combineAdjacentLinks(textItems, rawLinks) {
     const combinedLinks = [];
@@ -177,21 +167,22 @@ class PDFToMarkdown {
     return combinedLinks;
   }
 
-  async processContent(pdfData) {
+  async processContent() {
     const pages = Array.from(this.pageTexts.values());
     
     let processedPages = pages.map((page, index) => {
       let processedText = this.processPage(page);
       
-      // Insert hyperlinks
+      // Insert hyperlinks for this page
       const pageLinks = this.hyperlinks.get(index + 1) || [];
       processedText = this.insertHyperlinks(processedText, pageLinks);
       
       return processedText;
     });
   
-    return processedPages.join('\n\n---\n\n');
+    return processedPages.join('\n\n---\n\n');  // Add separator between pages
   }
+  
   
 
   insertHyperlinks(text, links) {
@@ -200,11 +191,14 @@ class PDFToMarkdown {
     let result = text;
     const addedLinks = new Set();
   
+    // Sort links by text length (longer ones first)
+    links.sort((a, b) => b.text.length - a.text.length);
+  
     links.forEach(link => {
       if (link.text && link.url && !addedLinks.has(link.url)) {
         const escapedText = this.escapeRegExp(link.text.trim());
         const markdownLink = `[${link.text.trim()}](${link.url})`;
-        
+  
         const regex = new RegExp(`(?<!\\[|\\]\\()${escapedText}(?!\\]|\\))`, 'g');
         result = result.replace(regex, markdownLink);
   
@@ -214,7 +208,6 @@ class PDFToMarkdown {
   
     return result;
   }
-  
   
 
   escapeRegExp(string) {

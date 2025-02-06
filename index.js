@@ -1,151 +1,286 @@
 const fs = require('fs');
-const pdfjsLib = require('pdfjs-dist');
-const path = require('path');
+const pdf = require('pdf-parse');
+const sanitize = require('sanitize-filename');
 
-class PDFLinkDetector {
-  constructor() {
-    // Get the worker source file path
-    const workerPath = path.join(
-      path.dirname(require.resolve('pdfjs-dist/package.json')),
-      'build',
-      'pdf.worker.js'
-    );
-
-    if (fs.existsSync(workerPath)) {
-      pdfjsLib.GlobalWorkerOptions.workerSrc = workerPath;
-    } else {
-      // Fallback to CDN if local file not found
-      pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
-    }
+class PDFToMarkdown {
+  constructor(options = {}) {
+    this.options = {
+      preserveFormatting: true,
+      preserveLinks: true,
+      customPageRender: true,
+      ...options
+    };
+    this.hyperlinks = new Map();
+    this.pageTexts = new Map();
   }
 
-  async detectLinks(pdfPath) {
+  async convertFile(pdfPath, outputPath = null) {
     try {
-      // Read PDF file
-      const data = new Uint8Array(fs.readFileSync(pdfPath));
+      const dataBuffer = fs.readFileSync(pdfPath);
       
-      // Load PDF document
-      const pdfDocument = await pdfjsLib.getDocument({ data }).promise;
-      const numPages = pdfDocument.numPages;
-      
-      // Store all links
-      const allLinks = [];
+      const data = await pdf(dataBuffer, {
+        pagerender: this.renderPage.bind(this),
+        max: 0,
+        firstPage: 1
+      });
 
-      // Process each page
-      for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-        const page = await pdfDocument.getPage(pageNum);
-        
-        // Get annotations (which include links)
-        const annotations = await page.getAnnotations();
-        
-        // Get text content with positions
-        const textContent = await page.getTextContent({
-          includeMarkedContent: true
-        });
-        
-        // Get viewport for coordinate transformation
-        const viewport = page.getViewport({ scale: 1.0 });
-        
-        // Process links on this page
-        const pageLinks = this.processPageLinks(annotations, textContent, viewport, pageNum);
-        allLinks.push(...pageLinks);
+      const markdown = await this.processContent(data);
+
+      if (outputPath) {
+        fs.writeFileSync(sanitize(outputPath), markdown);
       }
 
-      return allLinks;
+      return markdown;
     } catch (error) {
-      throw new Error(`Failed to detect links: ${error.message}`);
+      throw new Error(`Conversion failed: ${error.message}`);
     }
   }
 
-  processPageLinks(annotations, textContent, viewport, pageNum) {
+  async renderPage(pageData) {
+    try {
+      // Get text content with all available metadata
+      const textContent = await pageData.getTextContent({
+        normalizeWhitespace: true,
+        disableCombineTextItems: false,
+        includeMarkedContent: true
+      });
+
+      // Process and store the text content
+      const { text, links } = this.processPageContent(textContent, pageData.pageNumber);
+      this.pageTexts.set(pageData.pageNumber, text);
+      this.hyperlinks.set(pageData.pageNumber, links);
+
+      return text;
+    } catch (error) {
+      console.error(`Error rendering page ${pageData.pageNumber}:`, error);
+      return '';
+    }
+  }
+
+  processPageContent(textContent, pageNumber) {
+    let text = '';
+    let lastY;
     const links = [];
-    
-    // Process link annotations
-    for (const annotation of annotations) {
-      // Check if it's a link annotation
-      if (annotation.subtype !== 'Link') continue;
+    const textItems = [];
 
-      // Transform PDF coordinates to viewport coordinates
-      const linkBounds = viewport.convertToViewportRectangle(annotation.rect);
-      const [x1, y1, x2, y2] = linkBounds;
+    // First pass: collect all text items with their positions
+    for (const item of textContent.items) {
+      const [, , , , x, y] = item.transform;
       
-      // Find text content within link bounds
-      const linkedText = this.findTextInBounds(
-        textContent.items,
-        Math.min(x1, x2), // Ensure correct order of coordinates
-        Math.min(y1, y2),
-        Math.max(x1, x2),
-        Math.max(y1, y2),
-        viewport
-      );
+      // Store text item with position information
+      textItems.push({
+        text: item.str,
+        x: x,
+        y: y,
+        width: item.width,
+        height: item.height || 0,
+        hasLink: item.hasOwnProperty('link') || item.hasOwnProperty('url')
+      });
 
-      // Only add if we found associated text
-      if (linkedText) {
+      // Build the page text
+      if (lastY !== undefined && Math.abs(lastY - y) > 5) {
+        text += '\n';
+      }
+      text += item.str;
+      lastY = y;
+
+      // Check for link properties
+      if (item.link || item.url) {
         links.push({
-          page: pageNum,
-          text: linkedText,
-          bounds: linkBounds,
-          url: annotation.url || null,
-          internal: annotation.dest || null,
-          action: annotation.action,
-          type: this.getLinkType(annotation)
+          text: item.str,
+          url: item.link || item.url,
+          x: x,
+          y: y
         });
       }
     }
 
-    return links;
+    // Second pass: combine adjacent text items that might be part of the same link
+    const combinedLinks = this.combineAdjacentLinks(textItems, links);
+
+    return {
+      text,
+      links: combinedLinks
+    };
   }
 
-  getLinkType(annotation) {
-    if (annotation.url) {
-      return 'external';
-    } else if (annotation.dest) {
-      return 'internal';
-    } else if (annotation.action) {
-      return `action:${annotation.action.type}`;
-    }
-    return 'unknown';
-  }
+  combineAdjacentLinks(textItems, rawLinks) {
+    const combinedLinks = [];
+    let currentLink = null;
 
-  findTextInBounds(textItems, x1, y1, x2, y2, viewport) {
-    const matchingItems = [];
-    const tolerance = 2; // Small tolerance for boundary matching
-
-    for (const item of textItems) {
-      // Get text item bounds
-      const itemBounds = viewport.convertToViewportRectangle([
-        item.transform[4],
-        item.transform[5],
-        item.transform[4] + item.width,
-        item.transform[5] + item.height
-      ]);
-
-      const [itemX1, itemY1, itemX2, itemY2] = itemBounds;
-
-      // Check if text item overlaps with link bounds
-      if (
-        Math.max(itemX1, x1) <= Math.min(itemX2, x2) + tolerance &&
-        Math.max(itemY1, y1) <= Math.min(itemY2, y2) + tolerance
-      ) {
-        matchingItems.push({
-          str: item.str,
-          x: itemX1,
-          y: itemY1
-        });
-      }
-    }
-
-    // Sort items by position (top to bottom, left to right)
-    matchingItems.sort((a, b) => {
-      if (Math.abs(a.y - b.y) < tolerance) {
+    // Sort text items by position (top to bottom, left to right)
+    textItems.sort((a, b) => {
+      if (Math.abs(a.y - b.y) < 5) { // Items on same line
         return a.x - b.x;
       }
-      return a.y - b.y;
+      return b.y - a.y;
     });
 
-    // Combine text from all matching items
-    return matchingItems.map(item => item.str).join(' ').trim();
+    // Analyze text items for potential link combinations
+    for (let i = 0; i < textItems.length; i++) {
+      const item = textItems[i];
+      
+      if (item.hasLink) {
+        const matchingRawLink = rawLinks.find(link => 
+          link.x === item.x && link.y === item.y
+        );
+
+        if (!currentLink) {
+          currentLink = {
+            text: item.text,
+            url: matchingRawLink?.url,
+            parts: [item]
+          };
+        } else {
+          // Check if this item is adjacent to current link
+          const lastPart = currentLink.parts[currentLink.parts.length - 1];
+          const isAdjacent = Math.abs(lastPart.y - item.y) < 5 && 
+                            Math.abs(lastPart.x + lastPart.width - item.x) < 10;
+
+          if (isAdjacent && matchingRawLink?.url === currentLink.url) {
+            currentLink.text += ' ' + item.text;
+            currentLink.parts.push(item);
+          } else {
+            if (currentLink.url) {
+              combinedLinks.push({
+                text: currentLink.text.trim(),
+                url: currentLink.url
+              });
+            }
+            currentLink = {
+              text: item.text,
+              url: matchingRawLink?.url,
+              parts: [item]
+            };
+          }
+        }
+      } else if (currentLink) {
+        if (currentLink.url) {
+          combinedLinks.push({
+            text: currentLink.text.trim(),
+            url: currentLink.url
+          });
+        }
+        currentLink = null;
+      }
+    }
+
+    // Add the last link if exists
+    if (currentLink && currentLink.url) {
+      combinedLinks.push({
+        text: currentLink.text.trim(),
+        url: currentLink.url
+      });
+    }
+
+    return combinedLinks;
+  }
+
+  async processContent(pdfData) {
+    const pages = Array.from(this.pageTexts.values());
+    
+    let processedPages = pages.map((page, index) => {
+      let processedText = this.processPage(page);
+      
+      // Insert hyperlinks
+      const pageLinks = this.hyperlinks.get(index + 1) || [];
+      processedText = this.insertHyperlinks(processedText, pageLinks);
+      
+      return processedText;
+    });
+
+    return processedPages.join('\n\n---\n\n');
+  }
+
+  insertHyperlinks(text, links) {
+    if (!links.length) return text;
+
+    let result = text;
+    // Sort links by text length (descending) to handle nested links correctly
+    links.sort((a, b) => b.text.length - a.text.length);
+
+    for (const link of links) {
+      if (link.text && link.url) {
+        // Escape special regex characters in the link text
+        const escapedText = this.escapeRegExp(link.text.trim());
+        const markdownLink = `[${link.text.trim()}](${link.url})`;
+        
+        // Create regex that avoids replacing already processed links
+        const regex = new RegExp(
+          `(?<!\\[|\\]\\()${escapedText}(?!\\]|\\))`,
+          'g'
+        );
+        
+        result = result.replace(regex, markdownLink);
+      }
+    }
+
+    return result;
+  }
+
+  escapeRegExp(string) {
+    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  processPage(pageText) {
+    let text = pageText
+      .replace(/\r\n/g, '\n')
+      .replace(/([^\n])\n([^\n])/g, '$1 $2')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+
+    text = this.detectAndFormatHeaders(text);
+    text = this.detectAndFormatLists(text);
+    
+    return text;
+  }
+
+  detectAndFormatHeaders(text) {
+    const lines = text.split('\n');
+    const formatted = lines.map((line) => {
+      const trimmedLine = line.trim();
+      
+      if (!trimmedLine) return '';
+      
+      if (
+        (trimmedLine.length < 100 && /^[A-Z][^a-z]{0,3}[A-Z\s\d]{3,}$/.test(trimmedLine)) ||
+        (/^[A-Z][\w\s]{2,50}$/.test(trimmedLine) && trimmedLine.toUpperCase() === trimmedLine)
+      ) {
+        return `# ${trimmedLine}`;
+      }
+      
+      return trimmedLine;
+    });
+
+    return formatted.join('\n');
+  }
+
+  detectAndFormatLists(text) {
+    const lines = text.split('\n');
+    let inList = false;
+    
+    const formatted = lines.map((line) => {
+      const trimmedLine = line.trim();
+      
+      const bulletMatch = trimmedLine.match(/^[-•*]\s+(.+)/);
+      const numberMatch = trimmedLine.match(/^(\d+[.)])\s+(.+)/);
+      
+      if (bulletMatch) {
+        inList = true;
+        return `- ${bulletMatch[1]}`;
+      } else if (numberMatch) {
+        inList = true;
+        return `${numberMatch[1]} ${numberMatch[2]}`;
+      } else if (inList && /^\s+/.test(line)) {
+        return line;
+      } else {
+        inList = false;
+        return line;
+      }
+    });
+
+    return formatted.join('\n');
   }
 }
 
-module.exports = PDFLinkDetector;
+module.exports = PDFToMarkdown;

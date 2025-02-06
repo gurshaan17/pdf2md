@@ -18,7 +18,6 @@ class PDFToMarkdown {
     try {
       const dataBuffer = fs.readFileSync(pdfPath);
       
-      // Load the PDF document
       const data = await pdf(dataBuffer, {
         pagerender: this.renderPage.bind(this),
         max: 0,
@@ -39,118 +38,142 @@ class PDFToMarkdown {
 
   async renderPage(pageData) {
     try {
-      // Get raw PDF page object for direct access to annotations
-      const page = await pageData.getPage();
-      
-      // Extract text content
-      const textContent = await page.getTextContent({
+      // Get text content with all available metadata
+      const textContent = await pageData.getTextContent({
         normalizeWhitespace: true,
         disableCombineTextItems: false,
         includeMarkedContent: true
       });
 
-      // Extract annotations (including links)
-      const annotations = await page.getAnnotations();
+      // Process and store the text content
+      const { text, links } = this.processPageContent(textContent, pageData.pageNumber);
+      this.pageTexts.set(pageData.pageNumber, text);
+      this.hyperlinks.set(pageData.pageNumber, links);
 
-      // Store page text content for later reference
-      let pageText = this.extractPageText(textContent);
-      this.pageTexts.set(pageData.pageNumber, pageText);
-
-      // Process clickable elements
-      await this.processClickableElements(page, annotations, textContent, pageData.pageNumber);
-
-      return pageText;
+      return text;
     } catch (error) {
       console.error(`Error rendering page ${pageData.pageNumber}:`, error);
       return '';
     }
   }
 
-  async processClickableElements(page, annotations, textContent, pageNumber) {
+  processPageContent(textContent, pageNumber) {
+    let text = '';
+    let lastY;
     const links = [];
-    const viewport = page.getViewport({ scale: 1.0 });
-
-    for (const annotation of annotations) {
-      if (annotation.subtype === 'Link' && (annotation.url || annotation.dest)) {
-        try {
-          // Get the rectangle coordinates for the link
-          const rect = viewport.convertToViewportRectangle(annotation.rect);
-          const [x1, y1, x2, y2] = rect;
-
-          // Find text content within the link area
-          const linkText = this.findTextInArea(textContent, x1, y1, x2, y2);
-          
-          if (linkText) {
-            links.push({
-              text: linkText.trim(),
-              url: annotation.url || this.processDestination(annotation.dest),
-              rect: rect
-            });
-          }
-        } catch (error) {
-          console.error(`Error processing link annotation:`, error);
-        }
-      }
-    }
-
-    // Store the processed links for this page
-    this.hyperlinks.set(pageNumber, links);
-  }
-
-  findTextInArea(textContent, x1, y1, x2, y2) {
     const textItems = [];
-    
+
+    // First pass: collect all text items with their positions
     for (const item of textContent.items) {
-      const [, , , , itemX, itemY] = item.transform;
+      const [, , , , x, y] = item.transform;
       
-      // Check if the text item falls within the link rectangle
-      // Note: PDF coordinates start from bottom-left, need to adjust Y coordinate
-      if (
-        itemX >= x1 && 
-        itemX <= x2 && 
-        itemY >= y1 && 
-        itemY <= y2
-      ) {
-        textItems.push({
+      // Store text item with position information
+      textItems.push({
+        text: item.str,
+        x: x,
+        y: y,
+        width: item.width,
+        height: item.height || 0,
+        hasLink: item.hasOwnProperty('link') || item.hasOwnProperty('url')
+      });
+
+      // Build the page text
+      if (lastY !== undefined && Math.abs(lastY - y) > 5) {
+        text += '\n';
+      }
+      text += item.str;
+      lastY = y;
+
+      // Check for link properties
+      if (item.link || item.url) {
+        links.push({
           text: item.str,
-          x: itemX,
-          y: itemY
+          url: item.link || item.url,
+          x: x,
+          y: y
         });
       }
     }
 
-    // Sort text items by position (left to right, top to bottom)
+    // Second pass: combine adjacent text items that might be part of the same link
+    const combinedLinks = this.combineAdjacentLinks(textItems, links);
+
+    return {
+      text,
+      links: combinedLinks
+    };
+  }
+
+  combineAdjacentLinks(textItems, rawLinks) {
+    const combinedLinks = [];
+    let currentLink = null;
+
+    // Sort text items by position (top to bottom, left to right)
     textItems.sort((a, b) => {
-      if (Math.abs(a.y - b.y) < 5) { // Items on same line (within 5 units)
+      if (Math.abs(a.y - b.y) < 5) { // Items on same line
         return a.x - b.x;
       }
       return b.y - a.y;
     });
 
-    return textItems.map(item => item.text).join(' ');
-  }
+    // Analyze text items for potential link combinations
+    for (let i = 0; i < textItems.length; i++) {
+      const item = textItems[i];
+      
+      if (item.hasLink) {
+        const matchingRawLink = rawLinks.find(link => 
+          link.x === item.x && link.y === item.y
+        );
 
-  processDestination(dest) {
-    // Handle internal PDF destinations (like "#page=5")
-    if (Array.isArray(dest)) {
-      return `#page=${dest[0]}`;
-    }
-    return dest;
-  }
+        if (!currentLink) {
+          currentLink = {
+            text: item.text,
+            url: matchingRawLink?.url,
+            parts: [item]
+          };
+        } else {
+          // Check if this item is adjacent to current link
+          const lastPart = currentLink.parts[currentLink.parts.length - 1];
+          const isAdjacent = Math.abs(lastPart.y - item.y) < 5 && 
+                            Math.abs(lastPart.x + lastPart.width - item.x) < 10;
 
-  extractPageText(textContent) {
-    let text = '';
-    let lastY;
-    
-    for (const item of textContent.items) {
-      if (lastY !== undefined && lastY !== item.transform[5]) {
-        text += '\n';
+          if (isAdjacent && matchingRawLink?.url === currentLink.url) {
+            currentLink.text += ' ' + item.text;
+            currentLink.parts.push(item);
+          } else {
+            if (currentLink.url) {
+              combinedLinks.push({
+                text: currentLink.text.trim(),
+                url: currentLink.url
+              });
+            }
+            currentLink = {
+              text: item.text,
+              url: matchingRawLink?.url,
+              parts: [item]
+            };
+          }
+        }
+      } else if (currentLink) {
+        if (currentLink.url) {
+          combinedLinks.push({
+            text: currentLink.text.trim(),
+            url: currentLink.url
+          });
+        }
+        currentLink = null;
       }
-      text += item.str;
-      lastY = item.transform[5];
     }
-    
-    return text;
+
+    // Add the last link if exists
+    if (currentLink && currentLink.url) {
+      combinedLinks.push({
+        text: currentLink.text.trim(),
+        url: currentLink.url
+      });
+    }
+
+    return combinedLinks;
   }
 
   async processContent(pdfData) {

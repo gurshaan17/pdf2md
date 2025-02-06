@@ -1,10 +1,22 @@
 const fs = require('fs');
 const pdfjsLib = require('pdfjs-dist');
+const path = require('path');
 
 class PDFLinkDetector {
   constructor() {
-    // Initialize PDFJS worker
-    pdfjsLib.GlobalWorkerOptions.workerSrc = require('pdfjs-dist/build/pdf.worker.js');
+    // Get the worker source file path
+    const workerPath = path.join(
+      path.dirname(require.resolve('pdfjs-dist/package.json')),
+      'build',
+      'pdf.worker.js'
+    );
+
+    if (fs.existsSync(workerPath)) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = workerPath;
+    } else {
+      // Fallback to CDN if local file not found
+      pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+    }
   }
 
   async detectLinks(pdfPath) {

@@ -38,17 +38,15 @@ class PDFToMarkdown {
 
   async renderPage(pageData) {
     try {
-      // Get text content
       const textContent = await pageData.getTextContent({
         normalizeWhitespace: true,
         disableCombineTextItems: false
       });
   
-      // Get annotations (includes links)
+      // Get annotations for links
       const annotations = await pageData.getAnnotations();
   
-      // Process and store the text content and links
-      const { text, links } = this.processPageContent(textContent, annotations, pageData.pageNumber);
+      const { text, links } = this.processPageContent(textContent, annotations);
       this.pageTexts.set(pageData.pageNumber, text);
       this.hyperlinks.set(pageData.pageNumber, links);
   
@@ -59,43 +57,43 @@ class PDFToMarkdown {
     }
   }
   
+  isWithinAnnotation(x, y, rect) {
+    const [x1, y1, x2, y2] = rect;
+    return x >= x1 && x <= x2 && y >= y1 && y <= y2;
+  }
+  
+  
 
-  processPageContent(textContent, annotations, pageNumber) {
+  processPageContent(textContent, annotations) {
     let text = '';
     let lastY;
     const links = [];
   
-    // Create a map of annotations by their positions (x, y)
+    // Map annotations to their approximate positions
     const annotationMap = annotations
-      .filter(ann => ann.subtype === 'Link' && ann.url)  // Only keep link annotations
+      .filter(ann => ann.subtype === 'Link' && ann.url)  // Filter only link annotations
       .map(ann => ({
-        x: ann.rect[0],  // X-coordinate of the annotation
-        y: ann.rect[1],  // Y-coordinate of the annotation
-        url: ann.url     // URL of the link
+        url: ann.url,
+        rect: ann.rect
       }));
   
     for (const item of textContent.items) {
       const [, , , , x, y] = item.transform;
   
-      // Build the page text
       if (lastY !== undefined && Math.abs(lastY - y) > 5) {
         text += '\n';
       }
       text += item.str;
       lastY = y;
   
-      // Check if this text item matches any annotation
-      const matchingAnnotation = annotationMap.find(
-        ann => Math.abs(ann.x - x) < 5 && Math.abs(ann.y - y) < 5
-      );
-  
-      if (matchingAnnotation) {
-        links.push({
-          text: item.str,
-          url: matchingAnnotation.url,
-          x: x,
-          y: y
-        });
+      // Check if the current text item overlaps with any annotation
+      for (const ann of annotationMap) {
+        if (this.isWithinAnnotation(x, y, ann.rect)) {
+          links.push({
+            text: item.str,
+            url: ann.url
+          });
+        }
       }
     }
   
@@ -104,6 +102,7 @@ class PDFToMarkdown {
       links
     };
   }
+  
   
 
   combineAdjacentLinks(textItems, rawLinks) {
@@ -196,29 +195,21 @@ class PDFToMarkdown {
 
   insertHyperlinks(text, links) {
     if (!links.length) return text;
-
+  
     let result = text;
-    // Sort links by text length (descending) to handle nested links correctly
-    links.sort((a, b) => b.text.length - a.text.length);
-
-    for (const link of links) {
+    links.forEach(link => {
       if (link.text && link.url) {
-        // Escape special regex characters in the link text
         const escapedText = this.escapeRegExp(link.text.trim());
         const markdownLink = `[${link.text.trim()}](${link.url})`;
         
-        // Create regex that avoids replacing already processed links
-        const regex = new RegExp(
-          `(?<!\\[|\\]\\()${escapedText}(?!\\]|\\))`,
-          'g'
-        );
-        
+        const regex = new RegExp(`(?<!\\[|\\]\\()${escapedText}(?!\\]|\\))`, 'g');
         result = result.replace(regex, markdownLink);
       }
-    }
-
+    });
+  
     return result;
   }
+  
 
   escapeRegExp(string) {
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

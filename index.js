@@ -11,21 +11,21 @@ class PDFToMarkdown {
       ...options
     };
     this.hyperlinks = new Map();
-    this.currentPageAnnotations = null;
+    this.pageTexts = new Map();
   }
 
   async convertFile(pdfPath, outputPath = null) {
     try {
       const dataBuffer = fs.readFileSync(pdfPath);
       
-      const options = {
+      // Load the PDF document
+      const data = await pdf(dataBuffer, {
         pagerender: this.renderPage.bind(this),
         max: 0,
         firstPage: 1
-      };
+      });
 
-      const pdfData = await pdf(dataBuffer, options);
-      const markdown = await this.processContent(pdfData);
+      const markdown = await this.processContent(data);
 
       if (outputPath) {
         fs.writeFileSync(sanitize(outputPath), markdown);
@@ -39,105 +39,122 @@ class PDFToMarkdown {
 
   async renderPage(pageData) {
     try {
-      // Get both text content and annotations
-      const [textContent, annotations] = await Promise.all([
-        pageData.getTextContent({
-          normalizeWhitespace: true,
-          disableCombineTextItems: false
-        }),
-        pageData.getAnnotations()
-      ]);
-
-      // Process and store annotations
-      this.processAnnotations(annotations, pageData.pageNumber);
-
-      let text = '';
-      let lastY;
-      let textItems = [];
-
-      // Process text items with position information
-      for (let item of textContent.items) {
-        if (lastY !== item.transform[5] && text.length > 0) {
-          text += '\n';
-        }
-
-        // Store text item with position for later link matching
-        textItems.push({
-          text: item.str,
-          x: item.transform[4],
-          y: item.transform[5],
-          width: item.width,
-          height: item.height || 0
-        });
-
-        text += item.str;
-        lastY = item.transform[5];
-      }
-
-      // Match text items with annotations
-      this.matchTextWithAnnotations(textItems, pageData.pageNumber);
+      // Get raw PDF page object for direct access to annotations
+      const page = await pageData.getPage();
       
-      return text;
+      // Extract text content
+      const textContent = await page.getTextContent({
+        normalizeWhitespace: true,
+        disableCombineTextItems: false,
+        includeMarkedContent: true
+      });
+
+      // Extract annotations (including links)
+      const annotations = await page.getAnnotations();
+
+      // Store page text content for later reference
+      let pageText = this.extractPageText(textContent);
+      this.pageTexts.set(pageData.pageNumber, pageText);
+
+      // Process clickable elements
+      await this.processClickableElements(page, annotations, textContent, pageData.pageNumber);
+
+      return pageText;
     } catch (error) {
-      console.error(`Error rendering page: ${error.message}`);
+      console.error(`Error rendering page ${pageData.pageNumber}:`, error);
       return '';
     }
   }
 
-  processAnnotations(annotations, pageNumber) {
+  async processClickableElements(page, annotations, textContent, pageNumber) {
     const links = [];
+    const viewport = page.getViewport({ scale: 1.0 });
+
+    for (const annotation of annotations) {
+      if (annotation.subtype === 'Link' && (annotation.url || annotation.dest)) {
+        try {
+          // Get the rectangle coordinates for the link
+          const rect = viewport.convertToViewportRectangle(annotation.rect);
+          const [x1, y1, x2, y2] = rect;
+
+          // Find text content within the link area
+          const linkText = this.findTextInArea(textContent, x1, y1, x2, y2);
+          
+          if (linkText) {
+            links.push({
+              text: linkText.trim(),
+              url: annotation.url || this.processDestination(annotation.dest),
+              rect: rect
+            });
+          }
+        } catch (error) {
+          console.error(`Error processing link annotation:`, error);
+        }
+      }
+    }
+
+    // Store the processed links for this page
+    this.hyperlinks.set(pageNumber, links);
+  }
+
+  findTextInArea(textContent, x1, y1, x2, y2) {
+    const textItems = [];
     
-    for (let annotation of annotations) {
-      if (annotation.subtype === 'Link' && annotation.url) {
-        links.push({
-          url: annotation.url,
-          rect: annotation.rect, // [x1, y1, x2, y2]
-          pageNumber: pageNumber
+    for (const item of textContent.items) {
+      const [, , , , itemX, itemY] = item.transform;
+      
+      // Check if the text item falls within the link rectangle
+      // Note: PDF coordinates start from bottom-left, need to adjust Y coordinate
+      if (
+        itemX >= x1 && 
+        itemX <= x2 && 
+        itemY >= y1 && 
+        itemY <= y2
+      ) {
+        textItems.push({
+          text: item.str,
+          x: itemX,
+          y: itemY
         });
       }
     }
 
-    this.hyperlinks.set(pageNumber, links);
+    // Sort text items by position (left to right, top to bottom)
+    textItems.sort((a, b) => {
+      if (Math.abs(a.y - b.y) < 5) { // Items on same line (within 5 units)
+        return a.x - b.x;
+      }
+      return b.y - a.y;
+    });
+
+    return textItems.map(item => item.text).join(' ');
   }
 
-  matchTextWithAnnotations(textItems, pageNumber) {
-    const links = this.hyperlinks.get(pageNumber) || [];
-    const matchedLinks = new Map();
-
-    for (let link of links) {
-      const [x1, y1, x2, y2] = link.rect;
-      
-      // Find all text items that overlap with the link rectangle
-      const overlappingText = textItems.filter(item => {
-        return (
-          item.x >= x1 && 
-          item.x <= x2 &&
-          item.y >= y1 && 
-          item.y <= y2
-        );
-      });
-
-      if (overlappingText.length > 0) {
-        // Combine overlapping text items into a single link
-        const linkText = overlappingText
-          .sort((a, b) => a.x - b.x)
-          .map(item => item.text)
-          .join(' ')
-          .trim();
-
-        matchedLinks.set(linkText, link.url);
-      }
+  processDestination(dest) {
+    // Handle internal PDF destinations (like "#page=5")
+    if (Array.isArray(dest)) {
+      return `#page=${dest[0]}`;
     }
+    return dest;
+  }
 
-    // Update the hyperlinks map with text-to-URL mappings
-    this.hyperlinks.set(pageNumber, Array.from(matchedLinks).map(([text, url]) => ({
-      text,
-      url
-    })));
+  extractPageText(textContent) {
+    let text = '';
+    let lastY;
+    
+    for (const item of textContent.items) {
+      if (lastY !== undefined && lastY !== item.transform[5]) {
+        text += '\n';
+      }
+      text += item.str;
+      lastY = item.transform[5];
+    }
+    
+    return text;
   }
 
   async processContent(pdfData) {
-    const pages = pdfData.text.split(/\f/).filter(page => page.trim());
+    const pages = Array.from(this.pageTexts.values());
     
     let processedPages = pages.map((page, index) => {
       let processedText = this.processPage(page);
@@ -159,16 +176,21 @@ class PDFToMarkdown {
     // Sort links by text length (descending) to handle nested links correctly
     links.sort((a, b) => b.text.length - a.text.length);
 
-    links.forEach(link => {
+    for (const link of links) {
       if (link.text && link.url) {
-        const markdownLink = `[${link.text}](${link.url})`;
-        // Use regex to replace the exact text while preserving case and avoiding nested links
+        // Escape special regex characters in the link text
+        const escapedText = this.escapeRegExp(link.text.trim());
+        const markdownLink = `[${link.text.trim()}](${link.url})`;
+        
+        // Create regex that avoids replacing already processed links
         const regex = new RegExp(
-          `(?<!\\[|\\]\\()${this.escapeRegExp(link.text)}(?!\\]|\\))`,'g'
+          `(?<!\\[|\\]\\()${escapedText}(?!\\]|\\))`,
+          'g'
         );
+        
         result = result.replace(regex, markdownLink);
       }
-    });
+    }
 
     return result;
   }

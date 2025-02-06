@@ -17,7 +17,6 @@ class PDFToMarkdown {
   async convertFile(pdfPath, outputPath = null) {
     try {
       const dataBuffer = fs.readFileSync(pdfPath);
-      
       const data = await pdf(dataBuffer, {
         pagerender: this.renderPage.bind(this),
         max: 0,
@@ -44,10 +43,7 @@ class PDFToMarkdown {
       });
   
       const annotations = await pageData.getAnnotations();
-      
-      // Create a more flexible link position mapping
-      const linkMap = this.createLinkMap(annotations, textContent);
-      const processedContent = this.processPageContent(textContent, linkMap);
+      const processedContent = this.processPageContent(textContent, annotations);
       
       this.pageTexts.set(pageData.pageNumber, processedContent.text);
       this.hyperlinks.set(pageData.pageNumber, processedContent.links);
@@ -59,88 +55,143 @@ class PDFToMarkdown {
     }
   }
 
-  createLinkMap(annotations, textContent) {
-    const linkMap = new Map();
-    
-    annotations.forEach(ann => {
-      if (ann.subtype === 'Link' && ann.url) {
-        // Find text items that fall within this annotation's rectangle
-        const linkedText = textContent.items.filter(item => {
-          const [, , , , x, y] = item.transform;
-          return this.isPointInRect(x, y, ann.rect);
-        });
+  processPageContent(textContent, annotations) {
+    const lines = this.groupTextItemsByLine(textContent.items);
+    const linkMap = this.createLinkMap(annotations);
+    const links = [];
+    let text = '';
 
-        linkedText.forEach(item => {
-          linkMap.set(item.str, ann.url);
-        });
-      }
+    lines.forEach(line => {
+      const processedLine = this.processLine(line, linkMap, links);
+      text += processedLine + '\n';
     });
 
-    return linkMap;
-  }
-
-  isPointInRect(x, y, rect) {
-    const [x1, y1, x2, y2] = rect;
-    const margin = 3; // Add a small margin for better text matching
-    return x >= (x1 - margin) && x <= (x2 + margin) && y >= (y1 - margin) && y <= (y2 + margin);
-  }
-
-  processPageContent(textContent, linkMap) {
-    let text = '';
-    const links = [];
-    let lastY;
-    let currentLine = '';
-    
-    for (const item of textContent.items) {
-      const [, , , , x, y] = item.transform;
-      
-      // Check for new line
-      if (lastY !== undefined && Math.abs(lastY - y) > 5) {
-        text += currentLine + '\n';
-        currentLine = '';
-      }
-      
-      // Check if this text is part of a link
-      if (linkMap.has(item.str)) {
-        links.push({
-          text: item.str,
-          url: linkMap.get(item.str)
-        });
-      }
-      
-      currentLine += item.str + (item.hasEOL ? '' : ' ');
-      lastY = y;
-    }
-    
-    // Add the last line
-    if (currentLine) {
-      text += currentLine;
-    }
-    
     return {
-      text: text.trim(),
+      text: this.normalizeSpacing(text.trim()),
       links: this.consolidateLinks(links)
     };
   }
 
   consolidateLinks(links) {
     const linkMap = new Map();
-    
     links.forEach(link => {
-      if (linkMap.has(link.url)) {
-        const existing = linkMap.get(link.url);
-        if (existing.text !== link.text) {
-          // Keep the longer text if different versions exist
-          if (link.text.length > existing.text.length) {
-            linkMap.set(link.url, link);
-          }
-        }
-      } else {
+      const existingLink = linkMap.get(link.url);
+      if (!existingLink || link.text.length > existingLink.text.length) {
         linkMap.set(link.url, link);
       }
     });
-    
     return Array.from(linkMap.values());
+  }
+
+  groupTextItemsByLine(items) {
+    const lines = new Map();
+    
+    items.forEach(item => {
+      const [, , , , x, y] = item.transform;
+      const roundedY = Math.round(y);
+      
+      if (!lines.has(roundedY)) {
+        lines.set(roundedY, []);
+      }
+      
+      lines.get(roundedY).push({
+        text: item.str,
+        x: Math.round(x),
+        y: roundedY,
+        width: this.estimateCharWidth(item.str)
+      });
+    });
+
+    return Array.from(lines.entries())
+      .sort(([y1], [y2]) => y2 - y1)
+      .map(([, items]) => items.sort((a, b) => a.x - b.x));
+  }
+
+  createLinkMap(annotations) {
+    const linkMap = new Map();
+    
+    annotations.forEach(ann => {
+      if (ann.subtype === 'Link' && ann.url) {
+        const key = JSON.stringify(ann.rect.map(n => Math.round(n)));
+        linkMap.set(key, ann.url);
+      }
+    });
+
+    return linkMap;
+  }
+
+  processLine(lineItems, linkMap, links) {
+    let lineText = '';
+    let currentWordParts = [];
+    let lastX = null;
+    const spacingThreshold = 3;
+
+    lineItems.forEach((item, index) => {
+      const isLastItem = index === lineItems.length - 1;
+      
+      // Check for links
+      for (const [rectKey, url] of linkMap.entries()) {
+        const rect = JSON.parse(rectKey);
+        if (this.isPointInRect(item.x, item.y, rect)) {
+          this.addToLinks(links, item.text, url);
+          break;
+        }
+      }
+
+      // Handle spacing
+      if (lastX !== null) {
+        const gap = item.x - lastX;
+        if (gap > spacingThreshold) {
+          if (currentWordParts.length > 0) {
+            lineText += currentWordParts.join('');
+            currentWordParts = [];
+          }
+          lineText += ' ';
+        }
+      }
+
+      currentWordParts.push(item.text);
+      lastX = item.x + item.width;
+
+      if (isLastItem && currentWordParts.length > 0) {
+        lineText += currentWordParts.join('');
+      }
+    });
+
+    return lineText.trim();
+  }
+
+  addToLinks(links, text, url) {
+    const existingLink = links.find(l => l.url === url);
+    if (existingLink) {
+      existingLink.text = this.combineText(existingLink.text, text);
+    } else {
+      links.push({ text, url });
+    }
+  }
+
+  combineText(existing, newText) {
+    return existing.includes(newText) ? existing : `${existing}${newText}`;
+  }
+
+  estimateCharWidth(char) {
+    return char.length * 8;
+  }
+
+  isPointInRect(x, y, rect) {
+    const [x1, y1, x2, y2] = rect;
+    const margin = 5;
+    return x >= (x1 - margin) && x <= (x2 + margin) && y >= (y1 - margin) && y <= (y2 + margin);
+  }
+
+  normalizeSpacing(text) {
+    return text
+      .replace(/\s+/g, ' ')
+      .replace(/\s*\|\s*/g, ' | ')
+      .replace(/\s+,\s*/g, ', ')
+      .replace(/\n\s*\n/g, '\n\n')
+      .replace(/([^\n])\n([^\n])/g, '$1 $2')
+      .trim();
   }
 
   async processContent(pdfData) {
@@ -152,30 +203,73 @@ class PDFToMarkdown {
       return this.insertHyperlinks(processedText, pageLinks);
     });
   
-    return processedPages.join('\n');
+    return this.formatMarkdown(processedPages.join('\n\n'));
+  }
+
+  processPage(pageText) {
+    let text = this.normalizeSpacing(pageText);
+    text = this.detectAndFormatSections(text);
+    text = this.detectAndFormatLists(text);
+    return text;
+  }
+
+  detectAndFormatSections(text) {
+    const lines = text.split('\n');
+    const formatted = lines.map(line => {
+      const trimmed = line.trim();
+      if (this.isSectionHeader(trimmed)) {
+        return `\n## ${trimmed}\n`;
+      }
+      return line;
+    });
+    return formatted.join('\n');
+  }
+
+  isSectionHeader(text) {
+    if (text.includes('@') || text.includes('http')) return false;
+    if (text.length > 50) return false;
+    
+    return (
+      text === text.toUpperCase() &&
+      text.length >= 3 &&
+      !/[^\w\s,-]/.test(text)
+    );
+  }
+
+  detectAndFormatLists(text) {
+    const lines = text.split('\n');
+    let formatted = [];
+    let inList = false;
+
+    lines.forEach(line => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('•') || trimmed.startsWith('-')) {
+        inList = true;
+        formatted.push(trimmed.replace(/^[•-]\s*/, '- '));
+      } else if (inList && trimmed === '') {
+        inList = false;
+        formatted.push('');
+      } else {
+        formatted.push(line);
+      }
+    });
+
+    return formatted.join('\n');
   }
 
   insertHyperlinks(text, links) {
     if (!links.length) return text;
     
     let result = text;
-    const processedLinks = new Map();
-    
-    // Sort links by text length (descending) to handle longer matches first
-    links.sort((a, b) => b.text.length - a.text.length);
-    
-    for (const link of links) {
-      if (!link.text || !link.url || processedLinks.has(link.url)) continue;
+    links.forEach(link => {
+      if (!link.text || !link.url) return;
       
       const escapedText = this.escapeRegExp(link.text.trim());
       const markdownLink = `[${link.text.trim()}](${link.url})`;
       
-      // Only replace exact matches that aren't already part of a markdown link
       const regex = new RegExp(`(?<!\\[)${escapedText}(?!\\]\\()`, 'g');
       result = result.replace(regex, markdownLink);
-      
-      processedLinks.set(link.url, true);
-    }
+    });
     
     return result;
   }
@@ -184,72 +278,20 @@ class PDFToMarkdown {
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
-  processPage(pageText) {
-    let text = pageText
-      .replace(/\r\n/g, '\n')
-      .replace(/([^\n])\n([^\n])/g, '$1 $2')
+  formatMarkdown(text) {
+    return text
+      // Format header section
+      .replace(/^(.*?)\n/, '$1\n\n')
+      // Add spacing around section headers
+      .replace(/\n##\s/g, '\n\n## ')
+      // Ensure consistent list formatting
+      .replace(/^-\s*/gm, '- ')
+      // Clean up multiple blank lines
       .replace(/\n{3,}/g, '\n\n')
+      // Ensure proper spacing around contact information
+      .replace(/\|\s*/g, ' | ')
+      // Clean up final output
       .trim();
-
-    text = this.detectAndFormatHeaders(text);
-    text = this.detectAndFormatLists(text);
-    
-    return text;
-  }
-
-  detectAndFormatHeaders(text) {
-    const lines = text.split('\n');
-    const formatted = lines.map((line) => {
-      const trimmedLine = line.trim();
-      
-      if (!trimmedLine) return '';
-      
-      if (this.isHeader(trimmedLine)) {
-        return `# ${trimmedLine}`;
-      }
-      
-      return trimmedLine;
-    });
-
-    return formatted.join('\n');
-  }
-
-  isHeader(text) {
-    if (text.includes('@') || text.includes('http')) return false;
-    if (text.length > 50) return false;
-    
-    // Improved header detection
-    return (
-      /^[A-Z][^a-z]{0,3}[A-Z\s\d]{3,}$/.test(text) ||
-      (text === text.toUpperCase() && /^[A-Z][\w\s-]{2,49}$/.test(text))
-    );
-  }
-
-  detectAndFormatLists(text) {
-    const lines = text.split('\n');
-    let inList = false;
-    
-    const formatted = lines.map((line) => {
-      const trimmedLine = line.trim();
-      
-      const bulletMatch = trimmedLine.match(/^[-•*]\s+(.+)/);
-      const numberMatch = trimmedLine.match(/^(\d+[.)])\s+(.+)/);
-      
-      if (bulletMatch) {
-        inList = true;
-        return `- ${bulletMatch[1]}`;
-      } else if (numberMatch) {
-        inList = true;
-        return `${numberMatch[1]} ${numberMatch[2]}`;
-      } else if (inList && /^\s+/.test(line)) {
-        return line;
-      } else {
-        inList = false;
-        return line;
-      }
-    });
-
-    return formatted.join('\n');
   }
 }
 

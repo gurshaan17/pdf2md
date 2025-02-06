@@ -38,142 +38,101 @@ class PDFToMarkdown {
 
   async renderPage(pageData) {
     try {
-      // Get text content with all available metadata
+      // Get text content with enhanced options
       const textContent = await pageData.getTextContent({
         normalizeWhitespace: true,
         disableCombineTextItems: false,
         includeMarkedContent: true
       });
 
-      // Process and store the text content
-      const { text, links } = this.processPageContent(textContent, pageData.pageNumber);
-      this.pageTexts.set(pageData.pageNumber, text);
-      this.hyperlinks.set(pageData.pageNumber, links);
+      // Process the page content
+      const processedContent = this.processPageContent(textContent, pageData);
+      this.pageTexts.set(pageData.pageNumber, processedContent.text);
+      this.hyperlinks.set(pageData.pageNumber, processedContent.links);
 
-      return text;
+      return processedContent.text;
     } catch (error) {
-      console.error(`Error rendering page ${pageData.pageNumber}:`, error);
+      console.error(`Error rendering page:`, error);
       return '';
     }
   }
 
-  processPageContent(textContent, pageNumber) {
+  processPageContent(textContent, pageData) {
+    const textItems = [];
+    const links = [];
     let text = '';
     let lastY;
-    const links = [];
-    const textItems = [];
+    let currentLinkParts = null;
 
-    // First pass: collect all text items with their positions
-    for (const item of textContent.items) {
+    // First pass: collect text items and identify potential link components
+    for (let i = 0; i < textContent.items.length; i++) {
+      const item = textContent.items[i];
       const [, , , , x, y] = item.transform;
-      
-      // Store text item with position information
-      textItems.push({
-        text: item.str,
-        x: x,
-        y: y,
-        width: item.width,
-        height: item.height || 0,
-        hasLink: item.hasOwnProperty('link') || item.hasOwnProperty('url')
-      });
 
-      // Build the page text
+      // Check for link markers in the text
+      const isLinkStart = item.str.includes('[') || item.str.includes('http');
+      const hasUrl = item.str.includes('http') || item.str.includes('www.') || item.str.includes('.com');
+      const nextItem = textContent.items[i + 1];
+
+      // Store item with position and link information
+      const textItem = {
+        text: item.str,
+        x,
+        y,
+        width: item.width || 0,
+        height: item.height || 0,
+        isLinkPart: isLinkStart || hasUrl || (currentLinkParts !== null)
+      };
+      textItems.push(textItem);
+
+      // Handle link detection
+      if (isLinkStart && !currentLinkParts) {
+        currentLinkParts = {
+          text: [],
+          url: hasUrl ? item.str : null
+        };
+      }
+
+      if (currentLinkParts) {
+        currentLinkParts.text.push(item.str);
+        
+        // Try to detect the end of a link
+        const isLinkEnd = item.str.includes(']') || 
+                         (hasUrl && (!nextItem || Math.abs(nextItem.transform[5] - y) > 5));
+        
+        if (isLinkEnd) {
+          const linkText = currentLinkParts.text.join(' ')
+            .replace(/\[|\]/g, '')
+            .trim();
+          
+          // Extract URL if present
+          let url = currentLinkParts.url;
+          if (!url) {
+            const urlMatch = linkText.match(/(https?:\/\/[^\s]+)/);
+            if (urlMatch) {
+              url = urlMatch[0];
+            }
+          }
+
+          if (url) {
+            links.push({
+              text: linkText.replace(url, '').trim() || url,
+              url: url
+            });
+          }
+          currentLinkParts = null;
+        }
+      }
+
+      // Build page text
       if (lastY !== undefined && Math.abs(lastY - y) > 5) {
         text += '\n';
       }
       text += item.str;
       lastY = y;
-
-      // Check for link properties
-      if (item.link || item.url) {
-        links.push({
-          text: item.str,
-          url: item.link || item.url,
-          x: x,
-          y: y
-        });
-      }
     }
 
-    // Second pass: combine adjacent text items that might be part of the same link
-    const combinedLinks = this.combineAdjacentLinks(textItems, links);
-
-    return {
-      text,
-      links: combinedLinks
-    };
-  }
-
-  combineAdjacentLinks(textItems, rawLinks) {
-    const combinedLinks = [];
-    let currentLink = null;
-
-    // Sort text items by position (top to bottom, left to right)
-    textItems.sort((a, b) => {
-      if (Math.abs(a.y - b.y) < 5) { // Items on same line
-        return a.x - b.x;
-      }
-      return b.y - a.y;
-    });
-
-    // Analyze text items for potential link combinations
-    for (let i = 0; i < textItems.length; i++) {
-      const item = textItems[i];
-      
-      if (item.hasLink) {
-        const matchingRawLink = rawLinks.find(link => 
-          link.x === item.x && link.y === item.y
-        );
-
-        if (!currentLink) {
-          currentLink = {
-            text: item.text,
-            url: matchingRawLink?.url,
-            parts: [item]
-          };
-        } else {
-          // Check if this item is adjacent to current link
-          const lastPart = currentLink.parts[currentLink.parts.length - 1];
-          const isAdjacent = Math.abs(lastPart.y - item.y) < 5 && 
-                            Math.abs(lastPart.x + lastPart.width - item.x) < 10;
-
-          if (isAdjacent && matchingRawLink?.url === currentLink.url) {
-            currentLink.text += ' ' + item.text;
-            currentLink.parts.push(item);
-          } else {
-            if (currentLink.url) {
-              combinedLinks.push({
-                text: currentLink.text.trim(),
-                url: currentLink.url
-              });
-            }
-            currentLink = {
-              text: item.text,
-              url: matchingRawLink?.url,
-              parts: [item]
-            };
-          }
-        }
-      } else if (currentLink) {
-        if (currentLink.url) {
-          combinedLinks.push({
-            text: currentLink.text.trim(),
-            url: currentLink.url
-          });
-        }
-        currentLink = null;
-      }
-    }
-
-    // Add the last link if exists
-    if (currentLink && currentLink.url) {
-      combinedLinks.push({
-        text: currentLink.text.trim(),
-        url: currentLink.url
-      });
-    }
-
-    return combinedLinks;
+    return { text, links };
   }
 
   async processContent(pdfData) {
@@ -181,31 +140,27 @@ class PDFToMarkdown {
     
     let processedPages = pages.map((page, index) => {
       let processedText = this.processPage(page);
-      
-      // Insert hyperlinks
       const pageLinks = this.hyperlinks.get(index + 1) || [];
       processedText = this.insertHyperlinks(processedText, pageLinks);
-      
       return processedText;
     });
 
-    return processedPages.join('\n\n---\n\n');
+    return processedPages.join('\n\n');
   }
 
   insertHyperlinks(text, links) {
     if (!links.length) return text;
 
     let result = text;
-    // Sort links by text length (descending) to handle nested links correctly
     links.sort((a, b) => b.text.length - a.text.length);
 
     for (const link of links) {
       if (link.text && link.url) {
-        // Escape special regex characters in the link text
-        const escapedText = this.escapeRegExp(link.text.trim());
-        const markdownLink = `[${link.text.trim()}](${link.url})`;
+        // Format the markdown link
+        const markdownLink = `[${link.text}](${link.url})`;
         
-        // Create regex that avoids replacing already processed links
+        // Create regex that matches the link text but not if it's already part of a markdown link
+        const escapedText = this.escapeRegExp(link.text);
         const regex = new RegExp(
           `(?<!\\[|\\]\\()${escapedText}(?!\\]|\\))`,
           'g'

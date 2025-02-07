@@ -1,6 +1,6 @@
 {
     "name": "pdf-to-markdown-converter",
-    "version": "1.16.4",
+    "version": "1.17.0",
     "description": "Convert PDF files to Markdown format with hyperlink support",
     "main": "index.js",
     "scripts": {

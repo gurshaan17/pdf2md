@@ -43,22 +43,6 @@ class PDFToMarkdown {
     }
   }
 
-  async convertBufferAndReturn(pdfBuffer) {
-    try {
-        const data = await pdf(pdfBuffer, {
-            pagerender: this.renderPage.bind(this),
-            max: 0,
-            firstPage: 1
-        });
-
-        const markdown = await this.processContent(data);
-        return markdown;  // Return the markdown content directly
-    } catch (error) {
-        throw new Error(`Buffer conversion failed: ${error.message}`);
-    }
-  }
-
-
   async renderPage(pageData) {
     try {
       const textContent = await pageData.getTextContent({
@@ -122,19 +106,17 @@ class PDFToMarkdown {
 
   createLinkMap(annotations) {
     const linkMap = new Map();
-  
+
     annotations.forEach(ann => {
       if (ann.subtype === 'Link' && ann.url) {
         const key = ann.rect.map(n => Math.round(n * 100) / 100).join(',');
-  
         linkMap.set(key, {
           url: ann.url,
-          rect: ann.rect,
-          text: ann.contents || 'Link'  // Ensure we capture the annotation text
+          rect: ann.rect
         });
       }
     });
-  
+
     return linkMap;
   }
 
@@ -144,12 +126,12 @@ class PDFToMarkdown {
     let lastX = null;
     const spacingThreshold = 3;
     let currentLinks = new Set();
-  
+
     lineItems.forEach((item, index) => {
       const isLastItem = index === lineItems.length - 1;
-  
+
       for (const [, linkInfo] of linkMap) {
-        if (this.isPointInRect(item.x, item.y, linkInfo.rect) && item.text === 'Link') {
+        if (this.isPointInRect(item.x, item.y, linkInfo.rect)) {
           currentLinks.add({
             text: item.text,
             url: linkInfo.url,
@@ -161,7 +143,7 @@ class PDFToMarkdown {
           });
         }
       }
-  
+
       if (lastX !== null) {
         const gap = item.x - (lastX + this.estimateCharWidth(lineItems[index - 1].text));
         if (gap > spacingThreshold) {
@@ -172,21 +154,21 @@ class PDFToMarkdown {
           lineText += ' ';
         }
       }
-  
+
       currentWordParts.push(item.text);
       lastX = item.x;
-  
+
       if (isLastItem && currentWordParts.length > 0) {
         lineText += currentWordParts.join('');
       }
     });
-  
+
     currentLinks.forEach(link => {
       this.addToLinks(links, link);
     });
-  
+
     return lineText.trim();
-  }  
+  }
 
   addToLinks(links, linkInfo) {
     const existingLink = links.find(l => 
@@ -270,49 +252,83 @@ class PDFToMarkdown {
     links.forEach(link => {
         if (!link.text || !link.url) return;
 
-        const positionKey = `${link.position.x},${link.position.y}`;
+        const positionKey = `${link.position.x},${link.position.y},${link.position.page}`; 
         if (processedPositions.has(positionKey)) return;
 
-        const escapedText = this.escapeRegExp(link.text.trim());
-        const markdownLink = `[${link.text.trim()}](${link.url})`;
+        const linkWords = link.text.trim().split(/\s+/);
+        const textWords = text.split(/\s+/);
+        let startIndex = -1;
 
-        // Ensure we only replace exact text matches to avoid replacing standalone "L"
-        const regex = new RegExp(`(?<!\\w)${escapedText}(?!\\w)`, 'g');
-        result = result.replace(regex, markdownLink);
+        for (let i = 0; i <= textWords.length - linkWords.length; i++) {
+          let match = true;
+          for (let j = 0; j < linkWords.length; j++) {
+            if (textWords[i + j].trim() !== linkWords[j].trim()) {
+              match = false;
+              break;
+            }
+          }
+          if (match) {
+            startIndex = i;
+            break;
+          }
+        }
 
-        processedPositions.add(positionKey);
+        if (startIndex !== -1) {
+          const endIndex = startIndex + linkWords.length;
+          const markdownLink = `[${linkWords.join(' ')}](${link.url})`;
+          textWords.splice(startIndex, linkWords.length, markdownLink);
+          result = textWords.join(' ');
+          processedPositions.add(positionKey);
+        } else {
+          // Fallback: If exact match fails, try replacing any occurrence of the link text.
+          const escapedText = this.escapeRegExp(link.text.trim());
+          const regex = new RegExp(escapedText, 'g');
+          const markdownLink = `[${link.text.trim()}](${link.url})`;
+          result = result.replace(regex, markdownLink);
+          processedPositions.add(positionKey);
+        }
     });
+
     return result;
 }
+
 
   escapeRegExp(string) {
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   normalizeSpacing(text) {
-    return text.replace(/\s+/g, ' ').trim();
+    return text.replace(/\s{2,}/g, ' ').trim();
   }
 
   detectAndFormatSections(text) {
     const lines = text.split('\n');
-    const formatted = lines.map(line => {
+    const formatted = [];
+    let lastLineWasHeader = false;
+
+    lines.forEach((line, index) => {
       const trimmed = line.trim();
       if (this.isSectionHeader(trimmed)) {
-        return `\n## ${trimmed}\n`;
+        if (index !== 0 && !lastLineWasHeader) {
+          formatted.push('');
+        }
+        formatted.push(`\n## ${trimmed}\n`);
+        lastLineWasHeader = true;
+      } else {
+        formatted.push(line);
+        lastLineWasHeader = false;
       }
-      return line;
     });
     return formatted.join('\n');
   }
 
   isSectionHeader(text) {
     if (text.includes('@') || text.includes('http')) return false;
-    if (text.length > 50) return false;
+    if (text.length > 70) return false;
 
     return (
-      text === text.toUpperCase() &&
-      text.length >= 3 &&
-      !/[^\w\s,-]/.test(text)
+      text === text.toUpperCase() ||
+      (text.length >= 2 && !/[^\w\s,-]/.test(text))
     );
   }
 
@@ -321,12 +337,14 @@ class PDFToMarkdown {
     let formatted = [];
     let inList = false;
 
-    lines.forEach(line => {
+    lines.forEach((line, index) => {
       const trimmed = line.trim();
-      if (trimmed.startsWith('•') || trimmed.startsWith('-')) {
+      const isListItem = trimmed.startsWith('•') || trimmed.startsWith('-') || /^\d+\./.test(trimmed);
+
+      if (isListItem) {
         inList = true;
-        formatted.push(trimmed.replace(/^[•-]\s*/, '- '));
-      } else if (inList && trimmed === '') {
+        formatted.push(trimmed.replace(/^[•-\d.]\s*/, '- '));
+      } else if (inList && (trimmed === '' || !isListItem && index > 0 && lines[index - 1].trim() !== '')) {
         inList = false;
         formatted.push('');
       } else {
@@ -345,7 +363,25 @@ class PDFToMarkdown {
       .replace(/\n{3,}/g, '\n\n')
       .trim();
   }
+
+  processContent(pdfData) {
+    const pages = Array.from(this.pageTexts.values());
+
+    let processedPages = pages.map((page, index) => {
+      let processedText = this.processPage(page);
+      const pageLinks = this.hyperlinks.get(index + 1) || [];
+      return this.insertHyperlinks(processedText, pageLinks);
+    });
+
+    return this.formatMarkdown(processedPages.join('\n\n'));
+  }
+
+  processPage(pageText) {
+    let text = this.normalizeSpacing(pageText);
+    text = this.detectAndFormatSections(text);
+    text = this.detectAndFormatLists(text);
+    return text;
+  }
 }
 
 module.exports = PDFToMarkdown;
-

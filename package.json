@@ -1,18 +1,37 @@
 {
-    "name": "pdf-to-markdown-converter",
-    "version": "1.17.0",
-    "description": "Convert PDF files to Markdown format with hyperlink support",
-    "main": "index.js",
-    "scripts": {
-      "test": "jest"
-    },
-    "keywords": ["pdf", "markdown", "converter", "hyperlinks"],
-    "dependencies": {
-      "pdf-parse": "^1.1.1",
-      "sanitize-filename": "^1.6.3",
-      "pdfjs-dist": "^4.10.38"
-    },
-    "devDependencies": {
-      "jest": "^29.7.0"
-    }
-  }
+  "name": "pdf-to-markdown-converter",
+  "version": "1.20.6",
+  "description": "Convert PDF documents to Markdown format with link preservation",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "test": "jest"
+  },
+  "keywords": [
+    "pdf",
+    "markdown",
+    "converter",
+    "typescript"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "pdf-parse": "^1.1.1",
+    "sanitize-filename": "^1.6.3"
+  },
+  "devDependencies": {
+    "@types/jest": "^27.0.0",
+    "@types/node": "^16.0.0",
+    "@types/pdf-parse": "^1.1.4",
+    "jest": "^27.0.0",
+    "ts-jest": "^27.0.0",
+    "typescript": "^4.5.0"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
+}

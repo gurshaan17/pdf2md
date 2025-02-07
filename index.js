@@ -43,7 +43,7 @@ class PDFToMarkdown {
       });
   
       const annotations = await pageData.getAnnotations();
-      const processedContent = this.processPageContent(textContent, annotations);
+      const processedContent = this.processPageContent(textContent, annotations, pageData.pageNumber);
       
       this.pageTexts.set(pageData.pageNumber, processedContent.text);
       this.hyperlinks.set(pageData.pageNumber, processedContent.links);
@@ -55,32 +55,21 @@ class PDFToMarkdown {
     }
   }
 
-  processPageContent(textContent, annotations) {
+  processPageContent(textContent, annotations, pageNumber) {
     const lines = this.groupTextItemsByLine(textContent.items);
     const linkMap = this.createLinkMap(annotations);
     const links = [];
     let text = '';
 
     lines.forEach(line => {
-      const processedLine = this.processLine(line, linkMap, links);
+      const processedLine = this.processLine(line, linkMap, links, pageNumber);
       text += processedLine + '\n';
     });
 
     return {
       text: this.normalizeSpacing(text.trim()),
-      links: this.consolidateLinks(links)
+      links
     };
-  }
-
-  consolidateLinks(links) {
-    const linkMap = new Map();
-    links.forEach(link => {
-      const existingLink = linkMap.get(link.url);
-      if (!existingLink || link.text.length > existingLink.text.length) {
-        linkMap.set(link.url, link);
-      }
-    });
-    return Array.from(linkMap.values());
   }
 
   groupTextItemsByLine(items) {
@@ -88,7 +77,7 @@ class PDFToMarkdown {
     
     items.forEach(item => {
       const [, , , , x, y] = item.transform;
-      const roundedY = Math.round(y);
+      const roundedY = Math.round(y * 100) / 100; // More precise rounding
       
       if (!lines.has(roundedY)) {
         lines.set(roundedY, []);
@@ -96,9 +85,9 @@ class PDFToMarkdown {
       
       lines.get(roundedY).push({
         text: item.str,
-        x: Math.round(x),
+        x: Math.round(x * 100) / 100,
         y: roundedY,
-        width: this.estimateCharWidth(item.str)
+        width: item.width || this.estimateCharWidth(item.str)
       });
     });
 
@@ -112,35 +101,46 @@ class PDFToMarkdown {
     
     annotations.forEach(ann => {
       if (ann.subtype === 'Link' && ann.url) {
-        const key = JSON.stringify(ann.rect.map(n => Math.round(n)));
-        linkMap.set(key, ann.url);
+        // Create a more precise key using all coordinates
+        const key = ann.rect.map(n => Math.round(n * 100) / 100).join(',');
+        linkMap.set(key, {
+          url: ann.url,
+          rect: ann.rect
+        });
       }
     });
 
     return linkMap;
   }
 
-  processLine(lineItems, linkMap, links) {
+  processLine(lineItems, linkMap, links, pageNumber) {
     let lineText = '';
     let currentWordParts = [];
     let lastX = null;
     const spacingThreshold = 3;
+    let currentLinks = new Set();
 
     lineItems.forEach((item, index) => {
       const isLastItem = index === lineItems.length - 1;
       
-      // Check for links
-      for (const [rectKey, url] of linkMap.entries()) {
-        const rect = JSON.parse(rectKey);
-        if (this.isPointInRect(item.x, item.y, rect)) {
-          this.addToLinks(links, item.text, url);
-          break;
+      // Check for links with improved precision
+      for (const [, linkInfo] of linkMap) {
+        if (this.isPointInRect(item.x, item.y, linkInfo.rect)) {
+          currentLinks.add({
+            text: item.text,
+            url: linkInfo.url,
+            position: {
+              x: item.x,
+              y: item.y,
+              page: pageNumber
+            }
+          });
         }
       }
 
       // Handle spacing
       if (lastX !== null) {
-        const gap = item.x - lastX;
+        const gap = item.x - (lastX + this.estimateCharWidth(lineItems[index - 1].text));
         if (gap > spacingThreshold) {
           if (currentWordParts.length > 0) {
             lineText += currentWordParts.join('');
@@ -151,47 +151,71 @@ class PDFToMarkdown {
       }
 
       currentWordParts.push(item.text);
-      lastX = item.x + item.width;
+      lastX = item.x;
 
       if (isLastItem && currentWordParts.length > 0) {
         lineText += currentWordParts.join('');
       }
     });
 
+    // Process collected links
+    currentLinks.forEach(link => {
+      this.addToLinks(links, link);
+    });
+
     return lineText.trim();
   }
 
-  addToLinks(links, text, url) {
-    const existingLink = links.find(l => l.url === url);
+  addToLinks(links, linkInfo) {
+    const existingLink = links.find(l => 
+      l.url === linkInfo.url && 
+      Math.abs(l.position.y - linkInfo.position.y) < 2 &&
+      l.position.page === linkInfo.position.page
+    );
+
     if (existingLink) {
-      existingLink.text = this.combineText(existingLink.text, text);
+      // Only combine if they're actually adjacent
+      const xDiff = Math.abs(existingLink.position.x - linkInfo.position.x);
+      if (xDiff < this.estimateCharWidth(existingLink.text)) {
+        existingLink.text = this.combineText(existingLink.text, linkInfo.text);
+        existingLink.position.x = Math.min(existingLink.position.x, linkInfo.position.x);
+      }
     } else {
-      links.push({ text, url });
+      links.push({
+        text: linkInfo.text,
+        url: linkInfo.url,
+        position: linkInfo.position
+      });
     }
   }
 
   combineText(existing, newText) {
-    return existing.includes(newText) ? existing : `${existing}${newText}`;
+    // Improved text combination logic
+    if (existing.includes(newText)) return existing;
+    if (newText.includes(existing)) return newText;
+    
+    // Check for partial overlaps
+    const words = existing.split(/\s+/);
+    const newWords = newText.split(/\s+/);
+    
+    if (words[words.length - 1] === newWords[0]) {
+      return words.slice(0, -1).join(' ') + ' ' + newText;
+    }
+    
+    return existing + ' ' + newText;
   }
 
-  estimateCharWidth(char) {
-    return char.length * 8;
+  estimateCharWidth(text) {
+    // More accurate character width estimation
+    const averageCharWidth = 8;
+    return text.length * averageCharWidth;
   }
 
   isPointInRect(x, y, rect) {
     const [x1, y1, x2, y2] = rect;
-    const margin = 5;
-    return x >= (x1 - margin) && x <= (x2 + margin) && y >= (y1 - margin) && y <= (y2 + margin);
-  }
-
-  normalizeSpacing(text) {
-    return text
-      .replace(/\s+/g, ' ')
-      .replace(/\s*\|\s*/g, ' | ')
-      .replace(/\s+,\s*/g, ', ')
-      .replace(/\n\s*\n/g, '\n\n')
-      .replace(/([^\n])\n([^\n])/g, '$1 $2')
-      .trim();
+    const margin = 2; // Reduced margin for more precise detection
+    return x >= (x1 - margin) && x <= (x2 + margin) && 
+           y >= (y1 - margin) && y <= (y2 + margin);
   }
 
   async processContent(pdfData) {
@@ -206,11 +230,49 @@ class PDFToMarkdown {
     return this.formatMarkdown(processedPages.join('\n\n'));
   }
 
-  processPage(pageText) {
-    let text = this.normalizeSpacing(pageText);
-    text = this.detectAndFormatSections(text);
-    text = this.detectAndFormatLists(text);
-    return text;
+  insertHyperlinks(text, links) {
+    if (!links.length) return text;
+    
+    // Sort links by position to handle overlapping links correctly
+    links.sort((a, b) => {
+      if (a.position.y !== b.position.y) return b.position.y - a.position.y;
+      return a.position.x - b.position.x;
+    });
+    
+    let result = text;
+    const processedPositions = new Set();
+    
+    links.forEach(link => {
+      if (!link.text || !link.url) return;
+      
+      const positionKey = `${link.position.x},${link.position.y}`;
+      if (processedPositions.has(positionKey)) return;
+      
+      const escapedText = this.escapeRegExp(link.text.trim());
+      const markdownLink = `[${link.text.trim()}](${link.url})`;
+      
+      const regex = new RegExp(`(?<!\\[)${escapedText}(?!\\]\\()`, 'g');
+      result = result.replace(regex, markdownLink);
+      
+      processedPositions.add(positionKey);
+    });
+    
+    return result;
+  }
+
+  // Rest of the methods remain the same...
+  escapeRegExp(string) {
+    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  normalizeSpacing(text) {
+    return text
+      .replace(/\s+/g, ' ')
+      .replace(/\s*\|\s*/g, ' | ')
+      .replace(/\s+,\s*/g, ', ')
+      .replace(/\n\s*\n/g, '\n\n')
+      .replace(/([^\n])\n([^\n])/g, '$1 $2')
+      .trim();
   }
 
   detectAndFormatSections(text) {
@@ -257,40 +319,13 @@ class PDFToMarkdown {
     return formatted.join('\n');
   }
 
-  insertHyperlinks(text, links) {
-    if (!links.length) return text;
-    
-    let result = text;
-    links.forEach(link => {
-      if (!link.text || !link.url) return;
-      
-      const escapedText = this.escapeRegExp(link.text.trim());
-      const markdownLink = `[${link.text.trim()}](${link.url})`;
-      
-      const regex = new RegExp(`(?<!\\[)${escapedText}(?!\\]\\()`, 'g');
-      result = result.replace(regex, markdownLink);
-    });
-    
-    return result;
-  }
-
-  escapeRegExp(string) {
-    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  }
-
   formatMarkdown(text) {
     return text
-      // Format header section
       .replace(/^(.*?)\n/, '$1\n\n')
-      // Add spacing around section headers
       .replace(/\n##\s/g, '\n\n## ')
-      // Ensure consistent list formatting
       .replace(/^-\s*/gm, '- ')
-      // Clean up multiple blank lines
       .replace(/\n{3,}/g, '\n\n')
-      // Ensure proper spacing around contact information
       .replace(/\|\s*/g, ' | ')
-      // Clean up final output
       .trim();
   }
 }

@@ -43,6 +43,22 @@ class PDFToMarkdown {
     }
   }
 
+  async convertBufferAndReturn(pdfBuffer) {
+    try {
+        const data = await pdf(pdfBuffer, {
+            pagerender: this.renderPage.bind(this),
+            max: 0,
+            firstPage: 1
+        });
+
+        const markdown = await this.processContent(data);
+        return markdown;  // Return the markdown content directly
+    } catch (error) {
+        throw new Error(`Buffer conversion failed: ${error.message}`);
+    }
+  }
+
+
   async renderPage(pageData) {
     try {
       const textContent = await pageData.getTextContent({

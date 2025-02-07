@@ -1,6 +1,6 @@
 {
     "name": "pdf-to-markdown-converter",
-    "version": "1.16.2",
+    "version": "1.16.4",
     "description": "Convert PDF files to Markdown format with hyperlink support",
     "main": "index.js",
     "scripts": {
@@ -14,11 +14,5 @@
     },
     "devDependencies": {
       "jest": "^29.7.0"
-    },
-    "commands": {
-      "command": "workbench.action.terminal.sendSequence",
-      "args": {
-        "text": "npm install pdfjs-dist@latest\n"
-      }
     }
   }

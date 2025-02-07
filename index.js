@@ -122,17 +122,19 @@ class PDFToMarkdown {
 
   createLinkMap(annotations) {
     const linkMap = new Map();
-
+  
     annotations.forEach(ann => {
       if (ann.subtype === 'Link' && ann.url) {
         const key = ann.rect.map(n => Math.round(n * 100) / 100).join(',');
+  
         linkMap.set(key, {
           url: ann.url,
-          rect: ann.rect
+          rect: ann.rect,
+          text: ann.contents || 'Link'  // Ensure we capture the annotation text
         });
       }
     });
-
+  
     return linkMap;
   }
 
@@ -142,12 +144,12 @@ class PDFToMarkdown {
     let lastX = null;
     const spacingThreshold = 3;
     let currentLinks = new Set();
-
+  
     lineItems.forEach((item, index) => {
       const isLastItem = index === lineItems.length - 1;
-
+  
       for (const [, linkInfo] of linkMap) {
-        if (this.isPointInRect(item.x, item.y, linkInfo.rect)) {
+        if (this.isPointInRect(item.x, item.y, linkInfo.rect) && item.text === 'Link') {
           currentLinks.add({
             text: item.text,
             url: linkInfo.url,
@@ -159,7 +161,7 @@ class PDFToMarkdown {
           });
         }
       }
-
+  
       if (lastX !== null) {
         const gap = item.x - (lastX + this.estimateCharWidth(lineItems[index - 1].text));
         if (gap > spacingThreshold) {
@@ -170,21 +172,21 @@ class PDFToMarkdown {
           lineText += ' ';
         }
       }
-
+  
       currentWordParts.push(item.text);
       lastX = item.x;
-
+  
       if (isLastItem && currentWordParts.length > 0) {
         lineText += currentWordParts.join('');
       }
     });
-
+  
     currentLinks.forEach(link => {
       this.addToLinks(links, link);
     });
-
+  
     return lineText.trim();
-  }
+  }  
 
   addToLinks(links, linkInfo) {
     const existingLink = links.find(l => 
@@ -256,31 +258,32 @@ class PDFToMarkdown {
   insertHyperlinks(text, links) {
     if (!links.length) return text;
 
+    // Sort links by position to handle overlapping links correctly
     links.sort((a, b) => {
-      if (a.position.y !== b.position.y) return b.position.y - a.position.y;
-      return a.position.x - b.position.x;
+        if (a.position.y !== b.position.y) return b.position.y - a.position.y;
+        return a.position.x - b.position.x;
     });
 
     let result = text;
     const processedPositions = new Set();
 
     links.forEach(link => {
-      if (!link.text || !link.url) return;
+        if (!link.text || !link.url) return;
 
-      const positionKey = `${link.position.x},${link.position.y}`;
-      if (processedPositions.has(positionKey)) return;
+        const positionKey = `${link.position.x},${link.position.y}`;
+        if (processedPositions.has(positionKey)) return;
 
-      const escapedText = this.escapeRegExp(link.text.trim());
-      const markdownLink = `[${link.text.trim()}](${link.url})`;
+        const escapedText = this.escapeRegExp(link.text.trim());
+        const markdownLink = `[${link.text.trim()}](${link.url})`;
 
-      const regex = new RegExp(`(?<!\\[)${escapedText}(?!\\]\\()`, 'g');
-      result = result.replace(regex, markdownLink);
+        // Ensure we only replace exact text matches to avoid replacing standalone "L"
+        const regex = new RegExp(`(?<!\\w)${escapedText}(?!\\w)`, 'g');
+        result = result.replace(regex, markdownLink);
 
-      processedPositions.add(positionKey);
+        processedPositions.add(positionKey);
     });
-
     return result;
-  }
+}
 
   escapeRegExp(string) {
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -345,3 +348,4 @@ class PDFToMarkdown {
 }
 
 module.exports = PDFToMarkdown;
+
